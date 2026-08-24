@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   cat <<EOF
-Usage: $0 --svn-url <url> --github-org <org> --github-repo <repo> --authors-file <path> [--workdir <path>] [--github-host <host>]
+Usage: $0 --svn-url <url> --github-org <org> --github-repo <repo> --authors-file <path> [--workdir <path>] [--github-host <host>] [--allowed-admins <login1,login2>]
 
 Required environment variable:
   GITHUB_TOKEN    GitHub token with permission to create and push to repos in --github-org
@@ -11,6 +11,14 @@ Required environment variable:
 Optional environment variables:
   SVN_USERNAME    SVN username, if the source repo requires authentication
   SVN_PASSWORD    SVN password, if the source repo requires authentication
+
+--workdir must not already exist. This script always clones fresh into it,
+it never reuses a pre-existing directory, see REQUIREMENTS.md for why.
+
+--allowed-admins is a comma-separated list of GitHub logins permitted to be
+direct collaborators on a pre-existing destination repo under an
+organization. Defaults to none, meaning any direct collaborator on an
+existing org repo causes the run to refuse rather than push into it.
 EOF
   exit 1
 }
@@ -21,6 +29,7 @@ GITHUB_REPO=""
 AUTHORS_FILE=""
 WORKDIR=""
 GITHUB_HOST="github.com"
+ALLOWED_ADMINS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +39,7 @@ while [ $# -gt 0 ]; do
     --authors-file) AUTHORS_FILE="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     --github-host) GITHUB_HOST="$2"; shift 2 ;;
+    --allowed-admins) ALLOWED_ADMINS="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "Unknown argument: $1" >&2; usage ;;
   esac
@@ -55,24 +65,36 @@ done
 git svn --version >/dev/null 2>&1 || { echo "git-svn is not installed" >&2; exit 1; }
 
 # core.hooksPath is redirected to this empty directory, and core.fsmonitor is
-# cleared, on every git invocation that touches $WORKDIR. Without this, a
-# workdir reused from a shared/cached CI path could carry a planted
-# .git/hooks/* script or a core.fsmonitor command that executes arbitrary
-# code the moment git refreshes its index, e.g. during 'git svn rebase'.
+# cleared, on every git invocation this script makes, including the initial
+# clone. A denylist of dangerous config keys was tried here before and found
+# incomplete (filter/merge drivers, credential.helper, http.proxy, and
+# insteadOf rewrites are all separate code-execution or credential-exfiltration
+# vectors it didn't cover), see REQUIREMENTS.md. The actual fix is that this
+# script never operates against a pre-existing directory at all, see the
+# workdir handling below, these two overrides remain as cheap defense in
+# depth, not as the primary control.
 HOOKS_NEUTRALIZE_DIR=$(mktemp -d)
 safe_git() {
   git -c core.hooksPath="$HOOKS_NEUTRALIZE_DIR" -c core.fsmonitor= "$@"
 }
 
-SVN_AUTH_SEEDED=0
+# Every svn and git-svn call below runs with HOME pointed at this directory
+# instead of the real one, so their config and credential cache land here
+# instead of the shared, per-user ~/.subversion. 'svn --config-dir' looks like
+# the more direct way to do this, but it doesn't fully work, verified
+# directly, git svn clone still prompts interactively for a password when
+# pointed at a --config-dir a plain 'svn info' had already cached one in,
+# apparently not routing authentication through it consistently the way it
+# does for config file settings. Overriding HOME is what svn's own credential
+# lookup actually keys off, and it's what makes the plaintext SVN password
+# never land in a location any other job or workload running as the same
+# runner user would ever read from, whether or not this run's cleanup below
+# actually gets to execute.
+SVN_CONFIG_DIR=$(mktemp -d)
+
 cleanup() {
-  # The SVN credential only needs to live on disk long enough for the git-svn
-  # calls below to read it, git-svn has no way to accept a password directly.
-  # Remove it again once this run is done, success or failure, rather than
-  # leaving it in the shared auth cache indefinitely.
-  if [ "$SVN_AUTH_SEEDED" = "1" ]; then
-    HOSTPART=$(printf '%s' "$SVN_URL" | sed -E 's#^([a-zA-Z]+://[^/]+).*#\1#')
-    svn auth --remove "$SVN_USERNAME" "$HOSTPART" >/dev/null 2>&1 || true
+  if ! rm -rf "$SVN_CONFIG_DIR"; then
+    echo "Warning: failed to remove the isolated SVN config directory $SVN_CONFIG_DIR, it may still contain a cached SVN credential." >&2
   fi
   rm -rf "$HOOKS_NEUTRALIZE_DIR"
 }
@@ -86,23 +108,55 @@ if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
   # svn to actually cache it, the stock 'ask' default silently declines to
   # persist the password under --non-interactive, which would otherwise make
   # the later git-svn calls fail to authenticate with no cached credential.
-  printf '%s' "$SVN_PASSWORD" | svn info --non-interactive \
+  printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn info --non-interactive \
     --config-option servers:global:store-plaintext-passwords=yes \
     --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL" >/dev/null
-  SVN_AUTH_SEEDED=1
 fi
 
-echo "Ensuring GitHub repository $GITHUB_ORG/$GITHUB_REPO exists on $GITHUB_HOST"
+# Every GitHub API call below goes through this helper so GITHUB_TOKEN is
+# supplied to curl over stdin via -K, never as a -H argument, which would
+# otherwise sit in that curl process's argv, readable by any local user via
+# /proc/<pid>/cmdline or ps for the life of the request.
 RESPONSE_FILE=$(mktemp)
+gh_curl() {
+  METHOD="$1"
+  URL="$2"
+  DATA="${3:-}"
+  {
+    printf 'header = "Authorization: token %s"\n' "$GITHUB_TOKEN"
+    printf 'header = "Accept: application/vnd.github+json"\n'
+    printf 'url = "%s"\n' "$URL"
+    printf 'request = "%s"\n' "$METHOD"
+    printf 'silent\n'
+    if [ -n "$DATA" ]; then
+      ESCAPED_DATA=$(printf '%s' "$DATA" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf 'header = "Content-Type: application/json"\n'
+      printf 'data = "%s"\n' "$ESCAPED_DATA"
+    fi
+    printf 'write-out = "%%{http_code}"\n'
+  } | curl -K - -o "$RESPONSE_FILE"
+}
+
+echo "Ensuring GitHub repository $GITHUB_ORG/$GITHUB_REPO exists on $GITHUB_HOST"
+
+# POST /orgs/{org}/repos only works when GITHUB_ORG is an organization, GitHub
+# has no such endpoint for personal accounts, creating there is POST
+# /user/repos instead. This also decides whether the collaborator check below
+# applies, personal accounts always list their own owner as a collaborator,
+# that's not a squatting signal there the way it is for an org repo.
+ACCOUNT_TYPE=$(gh_curl GET "$API_BASE/users/$GITHUB_ORG" >/dev/null; grep -o '"type": *"[^"]*"' "$RESPONSE_FILE" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
 
 # A repo that already exists under the target name could have been
 # pre-created by someone else, e.g. a low-privileged org member name-squatting
 # the destination before the pipeline's first run. Confirm it's actually
-# private and owned by the expected account before mirroring proprietary
-# source into it.
+# private, owned by the expected account, and, for an org destination, has no
+# unexpected direct collaborators, before mirroring proprietary source into
+# it. Private-and-org-owned alone isn't enough: a member of an org that allows
+# members to create their own repositories can pre-create a private repo
+# under the org and still retain admin on it as its creator, which passes a
+# private/owner-only check while leaving them fully in control of the repo.
 verify_repo_ownership() {
-  curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-    -o "$RESPONSE_FILE" "$API_BASE/repos/$GITHUB_ORG/$GITHUB_REPO"
+  gh_curl GET "$API_BASE/repos/$GITHUB_ORG/$GITHUB_REPO" >/dev/null
   PRIVATE_VAL=$(grep -o '"private": *[a-z]*' "$RESPONSE_FILE" | head -1 | sed -E 's/.*: *//')
   OWNER_LOGIN=$(grep -o '"login": *"[^"]*"' "$RESPONSE_FILE" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
 
@@ -116,38 +170,46 @@ verify_repo_ownership() {
     echo "Refusing to push: $GITHUB_ORG/$GITHUB_REPO is owned by '$OWNER_LOGIN', not '$GITHUB_ORG'." >&2
     exit 1
   fi
+
+  if [ "$ACCOUNT_TYPE" = "Organization" ]; then
+    COLLAB_STATUS=$(gh_curl GET "$API_BASE/repos/$GITHUB_ORG/$GITHUB_REPO/collaborators?affiliation=direct")
+    if [ "$COLLAB_STATUS" != "200" ]; then
+      echo "Refusing to push: couldn't confirm who has direct access to $GITHUB_ORG/$GITHUB_REPO, HTTP $COLLAB_STATUS." >&2
+      exit 1
+    fi
+    COLLABORATORS=$(grep -o '"login": *"[^"]*"' "$RESPONSE_FILE" | sed -E 's/.*"([^"]+)"$/\1/')
+    for login in $COLLABORATORS; do
+      login_lower=$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')
+      allowed="no"
+      OLD_IFS=$IFS
+      IFS=,
+      for allowed_login in $ALLOWED_ADMINS; do
+        [ "$(printf '%s' "$allowed_login" | tr '[:upper:]' '[:lower:]')" = "$login_lower" ] && allowed="yes"
+      done
+      IFS=$OLD_IFS
+      if [ "$allowed" = "no" ]; then
+        echo "Refusing to push: $GITHUB_ORG/$GITHUB_REPO has a direct collaborator, '$login', that isn't in --allowed-admins." >&2
+        echo "A repo created by an org member who allowed themselves to be added this way can retain admin access to it, even though it's private and org-owned." >&2
+        exit 1
+      fi
+    done
+  fi
 }
 
-EXISTS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github+json" \
-  "$API_BASE/repos/$GITHUB_ORG/$GITHUB_REPO")
+EXISTS_STATUS=$(gh_curl GET "$API_BASE/repos/$GITHUB_ORG/$GITHUB_REPO")
 
 if [ "$EXISTS_STATUS" = "200" ]; then
   echo "Repository already exists, verifying it before pushing."
   verify_repo_ownership
   echo "Ownership and visibility confirmed, continuing."
 else
-  # POST /orgs/{org}/repos only works when GITHUB_ORG is an organization, GitHub
-  # has no such endpoint for personal accounts, creating there is POST /user/repos
-  # instead. Ask the API which kind of account this is before picking one.
-  ACCOUNT_TYPE=$(curl -s \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    "$API_BASE/users/$GITHUB_ORG" | grep -o '"type": *"[^"]*"' | sed -E 's/.*"([^"]+)"$/\1/')
-
   if [ "$ACCOUNT_TYPE" = "Organization" ]; then
     CREATE_URL="$API_BASE/orgs/$GITHUB_ORG/repos"
   else
     CREATE_URL="$API_BASE/user/repos"
   fi
 
-  CREATE_STATUS=$(curl -s -o "$RESPONSE_FILE" -w '%{http_code}' \
-    -X POST \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    "$CREATE_URL" \
-    -d "{\"name\":\"$GITHUB_REPO\",\"auto_init\":false,\"private\":true}")
+  CREATE_STATUS=$(gh_curl POST "$CREATE_URL" "{\"name\":\"$GITHUB_REPO\",\"auto_init\":false,\"private\":true}")
 
   case "$CREATE_STATUS" in
     201) echo "Repository created." ;;
@@ -159,34 +221,32 @@ else
     *)
       echo "Failed to create repository, HTTP $CREATE_STATUS" >&2
       cat "$RESPONSE_FILE" >&2
-      rm -f "$RESPONSE_FILE"
       exit 1
       ;;
   esac
 fi
-rm -f "$RESPONSE_FILE"
 
-if [ -d "$WORKDIR/.git" ]; then
-  # A pre-existing workdir is only trustworthy if it's actually a checkout of
-  # the SVN URL this run was asked to import, not a directory an attacker
-  # planted at the same shared/cached path with a different svn-remote,
-  # malicious hooks, or a hijacked push destination.
-  EXISTING_SVN_URL=$(safe_git -C "$WORKDIR" config --get svn-remote.svn.url 2>/dev/null || true)
-  if [ "$EXISTING_SVN_URL" != "$SVN_URL" ]; then
-    echo "Refusing to reuse $WORKDIR: it's configured for SVN URL '$EXISTING_SVN_URL', not '$SVN_URL'." >&2
-    echo "If this is a stale or untrusted cache, clear it manually and retry." >&2
-    exit 1
-  fi
-  echo "Existing checkout found at $WORKDIR, fetching incremental updates"
-  ( cd "$WORKDIR" && safe_git svn rebase )
+# This script always clones fresh, it never reuses a pre-existing directory.
+# An earlier version tried to validate and reuse a pre-existing workdir for
+# faster incremental syncs, comparing its svn-remote.svn.url against
+# --svn-url before trusting it. That check compares a non-secret value, an
+# attacker able to write to a shared or predictable workdir path can set it
+# to match and pass the gate, then have the planted checkout's own config,
+# hooks, filters, or refs trusted from there. There's no complete fix for
+# that short of not trusting a pre-existing directory at all, so that's what
+# this does, see REQUIREMENTS.md.
+if [ -e "$WORKDIR" ]; then
+  echo "Refusing to use $WORKDIR: it already exists." >&2
+  echo "This script always creates a fresh checkout rather than reusing a directory it can't fully vouch for. Point --workdir at a path that doesn't exist yet." >&2
+  exit 1
+fi
+
+echo "Cloning full SVN history to $WORKDIR"
+mkdir -p "$(dirname "$WORKDIR")"
+if [ -n "${SVN_USERNAME:-}" ]; then
+  HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE" --username "$SVN_USERNAME"
 else
-  echo "No existing checkout, cloning full SVN history to $WORKDIR"
-  mkdir -p "$(dirname "$WORKDIR")"
-  if [ -n "${SVN_USERNAME:-}" ]; then
-    git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE" --username "$SVN_USERNAME"
-  else
-    git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE"
-  fi
+  HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE"
 fi
 
 cd "$WORKDIR"
@@ -198,14 +258,7 @@ if ! safe_git rev-parse HEAD >/dev/null 2>&1; then
 fi
 
 REMOTE_URL="https://$GITHUB_HOST/$GITHUB_ORG/$GITHUB_REPO.git"
-if safe_git remote | grep -q '^origin$'; then
-  safe_git remote set-url origin "$REMOTE_URL"
-else
-  safe_git remote add origin "$REMOTE_URL"
-fi
-# set-url without --push only touches remote.origin.url, a planted
-# remote.origin.pushurl in a reused workdir would otherwise survive and take
-# precedence over it on push.
+safe_git remote add origin "$REMOTE_URL"
 safe_git remote set-url --push origin "$REMOTE_URL"
 
 echo "Pushing mirror to $GITHUB_ORG/$GITHUB_REPO"
@@ -213,10 +266,10 @@ AUTH_HEADER=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
 # The header is scoped to this exact literal URL (http.<url>.extraheader)
 # rather than applied globally (http.extraheader), and supplied through
 # GIT_CONFIG_* environment variables rather than -c, so it never appears in
-# process argv. Scoping it to the literal URL also means that if a planted
-# pushurl or a url.*.insteadOf rewrite in a reused workdir redirects the
-# connection elsewhere, the header simply won't be attached to that request,
-# since it won't match the URL git actually connects to.
+# process argv. Scoping it to the literal URL also means that if something in
+# this run's own config redirected the connection elsewhere, the header
+# simply wouldn't be attached to that request, since it wouldn't match the
+# URL git actually connects to.
 GIT_CONFIG_COUNT=1 \
 GIT_CONFIG_KEY_0="http.${REMOTE_URL}.extraheader" \
 GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH_HEADER" \

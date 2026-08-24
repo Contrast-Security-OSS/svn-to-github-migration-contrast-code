@@ -46,7 +46,15 @@ def main():
     parser.add_argument("--authors-file", required=True)
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--github-host", default="github.com")
+    parser.add_argument(
+        "--allowed-admins",
+        default="",
+        help="Comma-separated GitHub logins permitted to be direct collaborators on a "
+        "pre-existing destination repo under an organization. Defaults to none, meaning "
+        "any direct collaborator on an existing org repo causes the run to refuse.",
+    )
     args = parser.parse_args()
+    allowed_admins = {a.strip().lower() for a in args.allowed_admins.split(",") if a.strip()}
 
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -73,33 +81,61 @@ def main():
     except (subprocess.CalledProcessError, FileNotFoundError):
         sys.exit("git-svn is not installed")
 
+    # This script always clones fresh, it never reuses a pre-existing
+    # directory. An earlier version tried to validate and reuse a
+    # pre-existing workdir for faster incremental syncs, comparing its
+    # svn-remote.svn.url against --svn-url before trusting it. That check
+    # compares a non-secret value, an attacker able to write to a shared or
+    # predictable workdir path can set it to match and pass the gate, then
+    # have the planted checkout's own config, hooks, filters, or refs
+    # trusted from there. There's no complete fix for that short of not
+    # trusting a pre-existing directory at all, so that's what this does,
+    # see REQUIREMENTS.md.
+    if os.path.exists(workdir):
+        sys.exit(
+            f"Refusing to use {workdir}: it already exists. This script always creates a "
+            "fresh checkout rather than reusing a directory it can't fully vouch for. "
+            "Point --workdir at a path that doesn't exist yet."
+        )
+
     # core.hooksPath is redirected to this empty directory, and core.fsmonitor
-    # is cleared, on every git invocation that touches workdir. Without this,
-    # a workdir reused from a shared/cached CI path could carry a planted
-    # .git/hooks/* script or a core.fsmonitor command that executes arbitrary
-    # code the moment git refreshes its index, e.g. during 'git svn rebase'.
+    # is cleared, on every git invocation this script makes, including the
+    # initial clone. A denylist of dangerous config keys was tried here
+    # before and found incomplete (filter/merge drivers, credential.helper,
+    # http.proxy, and insteadOf rewrites are all separate code-execution or
+    # credential-exfiltration vectors it didn't cover), see REQUIREMENTS.md.
+    # The actual fix is that this script never operates against a
+    # pre-existing directory at all, these two overrides remain as cheap
+    # defense in depth, not as the primary control.
     hooks_neutralize_dir = tempfile.mkdtemp()
     safe_git_args = ["-c", f"core.hooksPath={hooks_neutralize_dir}", "-c", "core.fsmonitor="]
 
     def safe_git(args_, cwd=None, env=None):
         run(["git", *safe_git_args, *args_], cwd=cwd, env=env)
 
-    svn_auth_seeded = False
+    # Every svn and git-svn call below runs with HOME pointed at this
+    # directory instead of the real one, so their config and credential
+    # cache land here instead of the shared, per-user ~/.subversion.
+    # 'svn --config-dir' looks like the more direct way to do this, but it
+    # doesn't fully work, verified directly, git svn clone still prompts
+    # interactively for a password when pointed at a --config-dir a plain
+    # 'svn info' had already cached one in, apparently not routing
+    # authentication through it consistently the way it does for config file
+    # settings. Overriding HOME is what svn's own credential lookup actually
+    # keys off, and it's what makes the plaintext SVN password never land in
+    # a location any other job or workload running as the same runner user
+    # would ever read from, whether or not this run's cleanup below actually
+    # gets to execute.
+    svn_home_dir = tempfile.mkdtemp()
+    svn_env = {**os.environ, "HOME": svn_home_dir}
 
     def cleanup():
-        # The SVN credential only needs to live on disk long enough for the
-        # git-svn calls below to read it, git-svn has no way to accept a
-        # password directly. Remove it again once this run is done, success
-        # or failure, rather than leaving it in the shared auth cache
-        # indefinitely.
-        if svn_auth_seeded:
-            import re
-
-            hostpart = re.sub(r"^([a-zA-Z]+://[^/]+).*", r"\1", args.svn_url)
-            subprocess.run(
-                ["svn", "auth", "--remove", svn_username, hostpart],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+        shutil.rmtree(svn_home_dir, ignore_errors=True)
+        if os.path.exists(svn_home_dir):
+            print(
+                f"Warning: failed to remove the isolated SVN config directory {svn_home_dir}, "
+                "it may still contain a cached SVN credential.",
+                file=sys.stderr,
             )
         shutil.rmtree(hooks_neutralize_dir, ignore_errors=True)
 
@@ -127,8 +163,8 @@ def main():
                     args.svn_url,
                 ],
                 input=svn_password.encode(),
+                env=svn_env,
             )
-            svn_auth_seeded = True
 
         print(f"Ensuring GitHub repository {args.github_org}/{args.github_repo} exists on {args.github_host}")
 
@@ -147,12 +183,31 @@ def main():
             )
             return urllib.request.urlopen(req, context=ssl_context)
 
+        # POST /orgs/{org}/repos only works when github_org is an
+        # organization, personal accounts use POST /user/repos instead. This
+        # also decides whether the collaborator check below applies,
+        # personal accounts always list their own owner as a collaborator,
+        # that's not a squatting signal there the way it is for an org repo.
+        account_type = "User"
+        try:
+            with gh_request(f"{api_base}/users/{args.github_org}") as resp:
+                account_type = json.loads(resp.read()).get("type", "User")
+        except urllib.error.HTTPError:
+            pass
+
         def verify_repo_ownership():
             # A repo that already exists under the target name could have
             # been pre-created by someone else, e.g. a low-privileged org
             # member name-squatting the destination before the pipeline's
-            # first run. Confirm it's actually private and owned by the
-            # expected account before mirroring proprietary source into it.
+            # first run. Confirm it's actually private, owned by the
+            # expected account, and, for an org destination, has no
+            # unexpected direct collaborators, before mirroring proprietary
+            # source into it. Private-and-org-owned alone isn't enough: a
+            # member of an org that allows members to create their own
+            # repositories can pre-create a private repo under the org and
+            # still retain admin on it as its creator, which passes a
+            # private/owner-only check while leaving them fully in control
+            # of the repo.
             with gh_request(f"{api_base}/repos/{args.github_org}/{args.github_repo}") as resp:
                 repo = json.loads(resp.read())
             if not repo.get("private"):
@@ -165,6 +220,28 @@ def main():
                     f"Refusing to push: {args.github_org}/{args.github_repo} is owned by "
                     f"'{owner_login}', not '{args.github_org}'."
                 )
+
+            if account_type == "Organization":
+                try:
+                    with gh_request(
+                        f"{api_base}/repos/{args.github_org}/{args.github_repo}/collaborators?affiliation=direct"
+                    ) as resp:
+                        collaborators = json.loads(resp.read())
+                except urllib.error.HTTPError as e:
+                    sys.exit(
+                        f"Refusing to push: couldn't confirm who has direct access to "
+                        f"{args.github_org}/{args.github_repo}, HTTP {e.code}."
+                    )
+                for collaborator in collaborators:
+                    login = collaborator.get("login", "")
+                    if login.lower() not in allowed_admins:
+                        sys.exit(
+                            f"Refusing to push: {args.github_org}/{args.github_repo} has a "
+                            f"direct collaborator, '{login}', that isn't in --allowed-admins. "
+                            "A repo created by an org member who added themselves this way "
+                            "can retain admin access to it, even though it's private and "
+                            "org-owned."
+                        )
 
         repo_exists = False
         try:
@@ -179,16 +256,6 @@ def main():
             verify_repo_ownership()
             print("Ownership and visibility confirmed, continuing.")
         else:
-            # POST /orgs/{org}/repos only works when github_org is an
-            # organization, personal accounts use POST /user/repos instead,
-            # ask the API which kind of account this is before picking one.
-            account_type = "User"
-            try:
-                with gh_request(f"{api_base}/users/{args.github_org}") as resp:
-                    account_type = json.loads(resp.read()).get("type", "User")
-            except urllib.error.HTTPError:
-                pass
-
             create_url = (
                 f"{api_base}/orgs/{args.github_org}/repos"
                 if account_type == "Organization"
@@ -210,43 +277,21 @@ def main():
                 else:
                     sys.exit(f"Failed to create repository, HTTP {e.code}: {e.read().decode(errors='replace')}")
 
-        git_dir = os.path.join(workdir, ".git")
-        if os.path.isdir(git_dir):
-            # A pre-existing workdir is only trustworthy if it's actually a
-            # checkout of the SVN URL this run was asked to import, not a
-            # directory an attacker planted at the same shared/cached path
-            # with a different svn-remote, malicious hooks, or a hijacked
-            # push destination.
-            existing_svn_url = subprocess.run(
-                ["git", *safe_git_args, "config", "--get", "svn-remote.svn.url"],
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            if existing_svn_url != args.svn_url:
-                sys.exit(
-                    f"Refusing to reuse {workdir}: it's configured for SVN URL "
-                    f"'{existing_svn_url}', not '{args.svn_url}'. If this is a stale or "
-                    "untrusted cache, clear it manually and retry."
-                )
-            print(f"Existing checkout found at {workdir}, fetching incremental updates")
-            safe_git(["svn", "rebase"], cwd=workdir)
-        else:
-            print(f"No existing checkout, cloning full SVN history to {workdir}")
-            parent = os.path.dirname(os.path.abspath(workdir))
-            os.makedirs(parent, exist_ok=True)
-            clone_cmd = [
-                "svn",
-                "clone",
-                "-s",
-                args.svn_url,
-                workdir,
-                "--authors-file",
-                args.authors_file,
-            ]
-            if svn_username:
-                clone_cmd += ["--username", svn_username]
-            run(["git", *clone_cmd])
+        print(f"Cloning full SVN history to {workdir}")
+        parent = os.path.dirname(os.path.abspath(workdir))
+        os.makedirs(parent, exist_ok=True)
+        clone_cmd = [
+            "svn",
+            "clone",
+            "-s",
+            args.svn_url,
+            workdir,
+            "--authors-file",
+            args.authors_file,
+        ]
+        if svn_username:
+            clone_cmd += ["--username", svn_username]
+        safe_git(clone_cmd, env=svn_env)
 
         head_check = subprocess.run(
             ["git", *safe_git_args, "rev-parse", "HEAD"], cwd=workdir, capture_output=True
@@ -259,16 +304,7 @@ def main():
             )
 
         remote_url = f"https://{args.github_host}/{args.github_org}/{args.github_repo}.git"
-        existing_remotes = subprocess.run(
-            ["git", *safe_git_args, "remote"], cwd=workdir, check=True, capture_output=True, text=True
-        ).stdout.split()
-        if "origin" in existing_remotes:
-            safe_git(["remote", "set-url", "origin", remote_url], cwd=workdir)
-        else:
-            safe_git(["remote", "add", "origin", remote_url], cwd=workdir)
-        # set-url without --push only touches remote.origin.url, a planted
-        # remote.origin.pushurl in a reused workdir would otherwise survive
-        # and take precedence over it on push.
+        safe_git(["remote", "add", "origin", remote_url], cwd=workdir)
         safe_git(["remote", "set-url", "--push", "origin", remote_url], cwd=workdir)
 
         print(f"Pushing mirror to {args.github_org}/{args.github_repo}")
@@ -277,10 +313,10 @@ def main():
         # rather than applied globally (http.extraheader), and supplied
         # through GIT_CONFIG_* environment variables rather than -c, so it
         # never appears in process argv. Scoping it to the literal URL also
-        # means that if a planted pushurl or a url.*.insteadOf rewrite in a
-        # reused workdir redirects the connection elsewhere, the header
-        # simply won't be attached to that request, since it won't match the
-        # URL git actually connects to.
+        # means that if something in this run's own config redirected the
+        # connection elsewhere, the header simply wouldn't be attached to
+        # that request, since it wouldn't match the URL git actually
+        # connects to.
         push_env = {
             **os.environ,
             "GIT_CONFIG_COUNT": "1",

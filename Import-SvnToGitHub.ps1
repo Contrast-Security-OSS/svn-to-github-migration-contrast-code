@@ -12,10 +12,16 @@ param(
     [Parameter(Mandatory = $true)][string]$GitHubRepo,
     [Parameter(Mandatory = $true)][string]$AuthorsFile,
     [string]$WorkDir,
-    [string]$GitHubHost = "github.com"
+    [string]$GitHubHost = "github.com",
+    # Comma-separated GitHub logins permitted to be direct collaborators on a
+    # pre-existing destination repo under an organization. Defaults to none,
+    # meaning any direct collaborator on an existing org repo causes the run
+    # to refuse rather than push into it.
+    [string]$AllowedAdmins = ""
 )
 
 $ErrorActionPreference = "Stop"
+$AllowedAdminsSet = @($AllowedAdmins -split "," | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim().ToLower() })
 
 if (-not $env:GITHUB_TOKEN) {
     throw "GITHUB_TOKEN environment variable is required"
@@ -40,42 +46,79 @@ if ($LASTEXITCODE -ne 0) {
     throw "git-svn is not installed"
 }
 
+# This script always clones fresh, it never reuses a pre-existing directory.
+# An earlier version tried to validate and reuse a pre-existing workdir for
+# faster incremental syncs, comparing its svn-remote.svn.url against
+# $SvnUrl before trusting it. That check compares a non-secret value, an
+# attacker able to write to a shared or predictable workdir path can set it
+# to match and pass the gate, then have the planted checkout's own config,
+# hooks, filters, or refs trusted from there. There's no complete fix for
+# that short of not trusting a pre-existing directory at all, so that's what
+# this does, see REQUIREMENTS.md.
+if (Test-Path $WorkDir) {
+    throw "Refusing to use $WorkDir`: it already exists. This script always creates a fresh checkout rather than reusing a directory it can't fully vouch for. Point -WorkDir at a path that doesn't exist yet."
+}
+
 # $ErrorActionPreference only governs PowerShell cmdlets, native executables
 # like git and svn signal failure solely through $LASTEXITCODE, so every call
 # that matters here is wrapped to check it explicitly and throw, rather than
-# silently falling through to the next step on a failed clone, rebase, or
-# push.
+# silently falling through to the next step on a failed clone or push.
 function Invoke-Checked {
-    param([string]$Exe, [string[]]$ExeArgs)
-    & $Exe @ExeArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Exe $($ExeArgs -join ' ') failed with exit code $LASTEXITCODE"
+    param([string]$Exe, [string[]]$ExeArgs, [hashtable]$ExtraEnv)
+    if ($ExtraEnv) {
+        foreach ($key in $ExtraEnv.Keys) { Set-Item "Env:$key" $ExtraEnv[$key] }
+    }
+    try {
+        & $Exe @ExeArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Exe $($ExeArgs -join ' ') failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        if ($ExtraEnv) {
+            foreach ($key in $ExtraEnv.Keys) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
+        }
     }
 }
 
 # core.hooksPath is redirected to this empty directory, and core.fsmonitor is
-# cleared, on every git invocation that touches $WorkDir. Without this, a
-# workdir reused from a shared/cached CI path could carry a planted
-# .git/hooks/* script or a core.fsmonitor command that executes arbitrary
-# code the moment git refreshes its index, e.g. during 'git svn rebase'.
+# cleared, on every git invocation this script makes, including the initial
+# clone. A denylist of dangerous config keys was tried here before and found
+# incomplete (filter/merge drivers, credential.helper, http.proxy, and
+# insteadOf rewrites are all separate code-execution or credential-exfiltration
+# vectors it didn't cover), see REQUIREMENTS.md. The actual fix is that this
+# script never operates against a pre-existing directory at all, these two
+# overrides remain as cheap defense in depth, not as the primary control.
 $HooksNeutralizeDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $HooksNeutralizeDir | Out-Null
 
 function Invoke-SafeGit {
     param(
         [Parameter(Mandatory = $true)][string[]]$GitArgs,
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+        [hashtable]$ExtraEnv
     )
     $prefix = @()
     if ($WorkingDirectory) { $prefix += @("-C", $WorkingDirectory) }
     $prefix += @("-c", "core.hooksPath=$HooksNeutralizeDir", "-c", "core.fsmonitor=")
-    & git @prefix @GitArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "git $($GitArgs -join ' ') failed with exit code $LASTEXITCODE"
-    }
+    Invoke-Checked "git" (@($prefix) + @($GitArgs)) $ExtraEnv
 }
 
-$SvnAuthSeeded = $false
+# Every svn and git-svn call below runs with HOME (and, on Windows, APPDATA)
+# pointed at this directory instead of the real one, so their config and
+# credential cache land here instead of the shared, per-user profile.
+# 'svn --config-dir' looks like the more direct way to do this, but it
+# doesn't fully work, verified directly on the shell and Python versions of
+# this script, git svn clone still prompts interactively for a password when
+# pointed at a --config-dir a plain 'svn info' had already cached one in,
+# apparently not routing authentication through it consistently the way it
+# does for config file settings. Overriding HOME/APPDATA is what svn's own
+# credential lookup actually keys off, and it's what makes the plaintext SVN
+# password never land in a location any other job or workload running as the
+# same runner user would ever read from, whether or not this run's cleanup
+# below actually gets to execute.
+$SvnHomeDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $SvnHomeDir | Out-Null
+$SvnIsolationEnv = @{ HOME = $SvnHomeDir; APPDATA = $SvnHomeDir }
 
 try {
     if ($SvnUsername -and $SvnPassword) {
@@ -87,13 +130,17 @@ try {
         # silently declines to persist the password under --non-interactive,
         # which would otherwise make the later git-svn calls fail to
         # authenticate with no cached credential.
-        $SvnPassword | svn info --non-interactive `
-            --config-option servers:global:store-plaintext-passwords=yes `
-            --username "$SvnUsername" --password-from-stdin "$SvnUrl" | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to authenticate to SVN as $SvnUsername"
+        foreach ($key in $SvnIsolationEnv.Keys) { Set-Item "Env:$key" $SvnIsolationEnv[$key] }
+        try {
+            $SvnPassword | svn info --non-interactive `
+                --config-option servers:global:store-plaintext-passwords=yes `
+                --username "$SvnUsername" --password-from-stdin "$SvnUrl" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to authenticate to SVN as $SvnUsername"
+            }
+        } finally {
+            foreach ($key in $SvnIsolationEnv.Keys) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
         }
-        $SvnAuthSeeded = $true
     }
 
     Write-Host "Ensuring GitHub repository $GitHubOrg/$GitHubRepo exists on $GitHubHost"
@@ -102,18 +149,51 @@ try {
         Accept        = "application/vnd.github+json"
     }
 
+    # POST /orgs/{org}/repos only works when GitHubOrg is an organization,
+    # personal accounts use POST /user/repos instead. This also decides
+    # whether the collaborator check below applies, personal accounts always
+    # list their own owner as a collaborator, that's not a squatting signal
+    # there the way it is for an org repo.
+    $AccountType = "User"
+    try {
+        $Account = Invoke-RestMethod -Uri "$ApiBase/users/$GitHubOrg" -Headers $Headers
+        $AccountType = $Account.type
+    } catch {
+        # Fall through with the User default if this lookup itself fails.
+    }
+
     function Test-RepoOwnership {
         # A repo that already exists under the target name could have been
         # pre-created by someone else, e.g. a low-privileged org member
         # name-squatting the destination before the pipeline's first run.
-        # Confirm it's actually private and owned by the expected account
-        # before mirroring proprietary source into it.
+        # Confirm it's actually private, owned by the expected account, and,
+        # for an org destination, has no unexpected direct collaborators,
+        # before mirroring proprietary source into it. Private-and-org-owned
+        # alone isn't enough: a member of an org that allows members to
+        # create their own repositories can pre-create a private repo under
+        # the org and still retain admin on it as its creator, which passes
+        # a private/owner-only check while leaving them fully in control of
+        # the repo.
         $Repo = Invoke-RestMethod -Uri "$ApiBase/repos/$GitHubOrg/$GitHubRepo" -Headers $Headers
         if (-not $Repo.private) {
             throw "Refusing to push: $GitHubOrg/$GitHubRepo is not private."
         }
         if ($Repo.owner.login.ToLower() -ne $GitHubOrg.ToLower()) {
             throw "Refusing to push: $GitHubOrg/$GitHubRepo is owned by '$($Repo.owner.login)', not '$GitHubOrg'."
+        }
+
+        if ($AccountType -eq "Organization") {
+            try {
+                $Collaborators = Invoke-RestMethod -Uri "$ApiBase/repos/$GitHubOrg/$GitHubRepo/collaborators?affiliation=direct" -Headers $Headers
+            } catch {
+                $StatusCode = $_.Exception.Response.StatusCode.value__
+                throw "Refusing to push: couldn't confirm who has direct access to $GitHubOrg/$GitHubRepo, HTTP ${StatusCode}."
+            }
+            foreach ($collaborator in $Collaborators) {
+                if ($AllowedAdminsSet -notcontains $collaborator.login.ToLower()) {
+                    throw "Refusing to push: $GitHubOrg/$GitHubRepo has a direct collaborator, '$($collaborator.login)', that isn't in -AllowedAdmins. A repo created by an org member who added themselves this way can retain admin access to it, even though it's private and org-owned."
+                }
+            }
         }
     }
 
@@ -134,16 +214,6 @@ try {
         Test-RepoOwnership
         Write-Host "Ownership and visibility confirmed, continuing."
     } else {
-        # POST /orgs/{org}/repos only works when GitHubOrg is an organization,
-        # personal accounts use POST /user/repos instead, ask the API which kind
-        # of account this is before picking one.
-        $AccountType = "User"
-        try {
-            $Account = Invoke-RestMethod -Uri "$ApiBase/users/$GitHubOrg" -Headers $Headers
-            $AccountType = $Account.type
-        } catch {
-            # Fall through with the User default if this lookup itself fails.
-        }
         $CreateUrl = if ($AccountType -eq "Organization") { "$ApiBase/orgs/$GitHubOrg/repos" } else { "$ApiBase/user/repos" }
         $Body = @{ name = $GitHubRepo; auto_init = $false; private = $true } | ConvertTo-Json
 
@@ -162,26 +232,12 @@ try {
         }
     }
 
-    if (Test-Path (Join-Path $WorkDir ".git")) {
-        # A pre-existing workdir is only trustworthy if it's actually a
-        # checkout of the SVN URL this run was asked to import, not a
-        # directory an attacker planted at the same shared/cached path with a
-        # different svn-remote, malicious hooks, or a hijacked push
-        # destination.
-        $ExistingSvnUrl = (git -C $WorkDir -c "core.hooksPath=$HooksNeutralizeDir" -c "core.fsmonitor=" config --get svn-remote.svn.url 2>$null)
-        if ($ExistingSvnUrl -ne $SvnUrl) {
-            throw "Refusing to reuse $WorkDir`: it's configured for SVN URL '$ExistingSvnUrl', not '$SvnUrl'. If this is a stale or untrusted cache, clear it manually and retry."
-        }
-        Write-Host "Existing checkout found at $WorkDir, fetching incremental updates"
-        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("svn", "rebase")
+    Write-Host "Cloning full SVN history to $WorkDir"
+    New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
+    if ($SvnUsername) {
+        Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile", "--username", "$SvnUsername") -ExtraEnv $SvnIsolationEnv
     } else {
-        Write-Host "No existing checkout, cloning full SVN history to $WorkDir"
-        New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
-        if ($SvnUsername) {
-            Invoke-Checked "git" @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile", "--username", "$SvnUsername")
-        } else {
-            Invoke-Checked "git" @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile")
-        }
+        Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile") -ExtraEnv $SvnIsolationEnv
     }
 
     git -C $WorkDir -c "core.hooksPath=$HooksNeutralizeDir" -c "core.fsmonitor=" rev-parse HEAD 2>$null | Out-Null
@@ -190,12 +246,7 @@ try {
     }
 
     $RemoteUrl = "https://$GitHubHost/$GitHubOrg/$GitHubRepo.git"
-    $Remotes = git -C $WorkDir -c "core.hooksPath=$HooksNeutralizeDir" -c "core.fsmonitor=" remote
-    if ($Remotes -contains "origin") {
-        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("remote", "set-url", "origin", $RemoteUrl)
-    } else {
-        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("remote", "add", "origin", $RemoteUrl)
-    }
+    Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("remote", "add", "origin", $RemoteUrl)
     # set-url without --push only touches remote.origin.url, a planted
     # remote.origin.pushurl in a reused workdir would otherwise survive and
     # take precedence over it on push.
@@ -207,30 +258,22 @@ try {
     # The header is scoped to this exact literal URL (http.<url>.extraheader)
     # rather than applied globally (http.extraheader), and supplied through
     # GIT_CONFIG_* environment variables rather than -c, so it never appears
-    # in process argv. Scoping it to the literal URL also means that if a
-    # planted pushurl or a url.*.insteadOf rewrite in a reused workdir
-    # redirects the connection elsewhere, the header simply won't be attached
-    # to that request, since it won't match the URL git actually connects to.
-    $env:GIT_CONFIG_COUNT = "1"
-    $env:GIT_CONFIG_KEY_0 = "http.$RemoteUrl.extraheader"
-    $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $AuthHeader"
-    try {
-        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("push", "--mirror", $RemoteUrl)
-    } finally {
-        Remove-Item Env:\GIT_CONFIG_COUNT, Env:\GIT_CONFIG_KEY_0, Env:\GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+    # in process argv. Scoping it to the literal URL also means that if
+    # something in this run's own config redirected the connection
+    # elsewhere, the header simply wouldn't be attached to that request,
+    # since it wouldn't match the URL git actually connects to.
+    $PushEnv = @{
+        GIT_CONFIG_COUNT   = "1"
+        GIT_CONFIG_KEY_0   = "http.$RemoteUrl.extraheader"
+        GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $AuthHeader"
     }
+    Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("push", "--mirror", $RemoteUrl) -ExtraEnv $PushEnv
 
     Write-Host "Done. GitHub will trigger the Contrast Scan integration from this push."
 } finally {
-    # The SVN credential only needs to live on disk long enough for the
-    # git-svn calls above to read it, git-svn has no way to accept a password
-    # directly. Remove it again once this run is done, success or failure,
-    # rather than leaving it in the shared auth cache indefinitely.
-    if ($SvnAuthSeeded) {
-        if ($SvnUrl -match '^([a-zA-Z]+://[^/]+)') {
-            $HostPart = $Matches[1]
-            svn auth --remove "$SvnUsername" "$HostPart" *> $null
-        }
+    Remove-Item -Recurse -Force $SvnHomeDir -ErrorAction SilentlyContinue
+    if (Test-Path $SvnHomeDir) {
+        Write-Warning "Failed to remove the isolated SVN config directory $SvnHomeDir, it may still contain a cached SVN credential."
     }
     Remove-Item -Recurse -Force $HooksNeutralizeDir -ErrorAction SilentlyContinue
 }

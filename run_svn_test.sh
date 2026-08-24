@@ -114,9 +114,13 @@ echo "Note, the GitHub username ($GH_USERNAME) isn't used for authentication by 
 
 export GITHUB_TOKEN="$GH_TOKEN"
 
+# The migration script refuses to reuse a pre-existing --workdir, on purpose,
+# see REQUIREMENTS.md. Use a fresh path each time this test harness runs so
+# re-running it to commit and migrate a second file doesn't just hit that
+# refusal.
 "$SCRIPTS_DIR/import_svn_to_github.sh" \
   --svn-url "file://$REPO_PATH" \
   --github-org "$GH_ORG" \
   --github-repo "$GH_REPO" \
   --authors-file "$AUTHORS_FILE" \
-  --workdir "/work/git-svn-clone"
+  --workdir "/work/git-svn-clone-$(date +%s)-$$"
