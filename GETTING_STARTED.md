@@ -4,6 +4,59 @@ This is the practical, copy-paste version, exact commands to run the migration a
 
 You can run any of the three scripts directly on your own machine or CI runner, Docker isn't required for real use, it was only used in `TESTING.md` to build a disposable sandbox.
 
+## Quick start from the zip file (local folder to GitHub)
+
+Use this when you have a plain folder (not SVN), such as `cargo-cats`, and want to create or update a GitHub repository from it.
+
+### 1) Unzip the archive
+
+```sh
+unzip send-files-to-github.zip
+cd svn-to-github-migration
+```
+
+If you're already inside this project directory, skip these two commands.
+
+### 2) Export your GitHub token
+
+```sh
+export GITHUB_TOKEN="YOUR_GITHUB_TOKEN"
+```
+
+### 3) Run `import_files_to_github.sh`
+
+```sh
+./import_files_to_github.sh \
+  --source-dir /workspace/cargo-cats \
+  --github-org your-github-org
+```
+
+What this does:
+
+- Uses the source folder name as the repository name when `--github-repo` is omitted. In this example, it targets `cargo-cats`.
+- Creates the destination repository automatically if it does not exist yet.
+- Initializes a git repo in the source directory if needed, adds all files, commits, and pushes to `main`.
+
+### 4) Optional flags
+
+```sh
+./import_files_to_github.sh \
+  --source-dir /workspace/cargo-cats \
+  --github-org your-github-org \
+  --github-repo cargo-cats \
+  --branch main \
+  --commit-author "Your Name <you@example.com>" \
+  --commit-message "Initial import of cargo-cats"
+```
+
+### 5) Example for a local machine path
+
+```sh
+./import_files_to_github.sh \
+  --source-dir "$HOME/projects/cargo-cats" \
+  --github-org your-github-org
+```
+
 ## Step 1, confirm the tools are installed
 
 Pick whichever script matches what's available, then check its dependencies.
