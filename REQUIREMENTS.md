@@ -95,6 +95,21 @@ If your pipeline's own identity legitimately needs to be a direct collaborator o
 
 If a push fails because a file exceeds GitHub's size limits, run `git lfs migrate import --everything --above=100MB` in the local clone before retrying the push. This isn't automated in the scripts since it rewrites history and should be a deliberate, reviewed step, not an automatic one in a pipeline.
 
+## Repositories too large to push with full history, `--snapshot-only`
+
+GitHub enforces a hard limit around 2GB on a single push. A full-history `git svn clone` of an old or large SVN repository routinely exceeds that, since it converts every revision that ever existed, not just the current one, a 10GB SVN repository, accumulated over years, can easily produce a `.git` well over that limit even when the current checked-out state is small.
+
+Since this tool's actual purpose is getting current code in front of Contrast Scan, not preserving history for its own sake, `--snapshot-only` (`-SnapshotOnly` in PowerShell) sidesteps the limit by not carrying any history at all. Instead of `git svn clone`, it runs `svn export --force` to grab just the current revision's files, then creates a single commit from that snapshot and pushes it. Two things fall out of this beyond just the size fix, verified directly:
+
+- `--authors-file` isn't needed or used. There's no per-revision author mapping to do, the whole export becomes one commit under `--commit-author` (`-CommitAuthor`), which defaults to `SVN Snapshot Import <svn-snapshot-import@localhost>` if you don't set it.
+- `--svn-url` doesn't need to point at a `trunk`/`branches`/`tags` layout at all, `svn export` just grabs whatever tree is at the URL you give it, the standard-layout requirement in "SVN repository layout" above is specific to `git svn clone -s`'s branch detection, snapshot mode doesn't use that codepath.
+
+Authentication is also simpler in this mode, and safer. `svn export` takes `--username`/`--password-from-stdin` directly on the one call that needs it, unlike `git svn`, which has no way to accept a password at all and depends entirely on SVN's credential cache. That means snapshot mode never seeds a credential into any cache, isolated or otherwise, there's nothing to clean up afterward. Confirmed directly, `svn export --password-from-stdin` under `--non-interactive` doesn't persist the password to disk even without `store-plaintext-passwords=yes`, only non-secret bookkeeping (the realm string and username) gets cached, and this tool still points `HOME` at a fresh per-run directory for that call anyway, out of the same caution as everywhere else, not because there's a secret at stake here.
+
+Each run in this mode produces a single, disconnected commit with no relationship to any previous run's commit, and the mirror push replaces whatever was there before, the same way full-history mode does. That's a deliberate choice, not an oversight, it's what keeps the destination repository permanently small regardless of how many times this runs, rather than slowly accumulating a "history of snapshots" that could itself grow back toward the size limit over enough runs. If a project genuinely needs SVN history preserved in Git, this isn't the mode for that, use the default full-history mode for repositories that fit under the push limit.
+
+Verified end to end, against a real authenticated SVN server with several revisions including a deleted file, in all three scripts, the resulting GitHub repository had exactly one commit, the deleted file was correctly absent, and the surviving files matched the current SVN revision.
+
 ## Script parameters
 
 All three scripts take the same inputs.
@@ -104,10 +119,12 @@ All three scripts take the same inputs.
 | SVN URL | yes | The SVN repository or branch URL to import |
 | GitHub org | yes | Destination GitHub organization |
 | GitHub repo | yes | Destination repository name |
-| Authors file | yes | Path to the authors mapping file above |
-| Work directory | no | Where the fresh git-svn checkout is created, defaults to `svn-import/<repo>`. Must not already exist, see "Every run clones fresh" above |
+| Authors file | yes, unless snapshot-only | Path to the authors mapping file above |
+| Work directory | no | Where the fresh checkout or export is created, defaults to `svn-import/<repo>`. Must not already exist, see "Every run clones fresh" above |
 | GitHub host | no | Defaults to `github.com`, set to a GitHub Enterprise Server hostname otherwise |
 | Allowed admins | no | Comma-separated GitHub logins permitted to be direct collaborators on a pre-existing destination repo under an organization. Defaults to none |
+| Snapshot only | no | Skip SVN history entirely, import just the current revision as a single commit. See "Repositories too large to push with full history" above |
+| Commit author | no | Git author and committer for the single snapshot commit, only used with snapshot only. Defaults to `SVN Snapshot Import <svn-snapshot-import@localhost>` |
 
 Environment variables, all pipeline secrets, never plain text:
 

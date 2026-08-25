@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--svn-url", required=True)
     parser.add_argument("--github-org", required=True)
     parser.add_argument("--github-repo", required=True)
-    parser.add_argument("--authors-file", required=True)
+    parser.add_argument("--authors-file", default=None)
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--github-host", default="github.com")
     parser.add_argument(
@@ -53,8 +53,25 @@ def main():
         "pre-existing destination repo under an organization. Defaults to none, meaning "
         "any direct collaborator on an existing org repo causes the run to refuse.",
     )
+    parser.add_argument(
+        "--snapshot-only",
+        action="store_true",
+        help="Skip SVN history entirely and import just the current revision as a single "
+        "commit with no history. Use this when the full SVN history is too large for a "
+        "single GitHub push, GitHub enforces a hard limit around 2GB per push. "
+        "--authors-file is not required or used in this mode, and --svn-url doesn't need "
+        "to point at a trunk/branches/tags layout, any URL within the repository works.",
+    )
+    parser.add_argument(
+        "--commit-author",
+        default="SVN Snapshot Import <svn-snapshot-import@localhost>",
+        help='Git author and committer, "Name <email>", for the single snapshot commit. '
+        "Only used with --snapshot-only.",
+    )
     args = parser.parse_args()
     allowed_admins = {a.strip().lower() for a in args.allowed_admins.split(",") if a.strip()}
+    if not args.snapshot_only and not args.authors_file:
+        parser.error("--authors-file is required unless --snapshot-only is set")
 
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -71,15 +88,16 @@ def main():
 
     for tool in ("git", "svn"):
         which_or_die(tool)
-    try:
-        subprocess.run(
-            ["git", "svn", "--version"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        sys.exit("git-svn is not installed")
+    if not args.snapshot_only:
+        try:
+            subprocess.run(
+                ["git", "svn", "--version"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            sys.exit("git-svn is not installed")
 
     # This script always clones fresh, it never reuses a pre-existing
     # directory. An earlier version tried to validate and reuse a
@@ -140,7 +158,7 @@ def main():
         shutil.rmtree(hooks_neutralize_dir, ignore_errors=True)
 
     try:
-        if svn_username and svn_password:
+        if not args.snapshot_only and svn_username and svn_password:
             print("Seeding SVN credential cache")
             # --password-from-stdin keeps the password out of argv, where it
             # would otherwise be readable by any local user via
@@ -149,7 +167,11 @@ def main():
             # cache it, the stock 'ask' default silently declines to persist
             # the password under --non-interactive, which would otherwise
             # make the later git-svn calls fail to authenticate with no
-            # cached credential.
+            # cached credential. --snapshot-only doesn't need any of this,
+            # 'svn export' takes credentials directly on every call, unlike
+            # git-svn it has no need to read them back out of a cache, so
+            # there's no plaintext password to cache or clean up in that
+            # mode at all.
             run(
                 [
                     "svn",
@@ -277,26 +299,76 @@ def main():
                 else:
                     sys.exit(f"Failed to create repository, HTTP {e.code}: {e.read().decode(errors='replace')}")
 
-        print(f"Cloning full SVN history to {workdir}")
         parent = os.path.dirname(os.path.abspath(workdir))
         os.makedirs(parent, exist_ok=True)
-        clone_cmd = [
-            "svn",
-            "clone",
-            "-s",
-            args.svn_url,
-            workdir,
-            "--authors-file",
-            args.authors_file,
-        ]
-        if svn_username:
-            clone_cmd += ["--username", svn_username]
-        safe_git(clone_cmd, env=svn_env)
+
+        if args.snapshot_only:
+            print(f"Exporting current revision (no history) from {args.svn_url} to {workdir}")
+            info_cmd = ["svn", "info", "--non-interactive", "--show-item", "revision"]
+            info_input = None
+            if svn_username and svn_password:
+                info_cmd += ["--username", svn_username, "--password-from-stdin"]
+                info_input = svn_password
+            info_cmd.append(args.svn_url)
+            rev = subprocess.run(
+                info_cmd,
+                input=info_input,
+                env=svn_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            export_cmd = ["svn", "export", "--force", "--non-interactive"]
+            export_input = None
+            if svn_username and svn_password:
+                export_cmd += ["--username", svn_username, "--password-from-stdin"]
+                export_input = svn_password.encode()
+            export_cmd += [args.svn_url, workdir]
+            run(export_cmd, input=export_input, env=svn_env)
+
+            if not any(os.scandir(workdir)):
+                sys.exit(
+                    f"Nothing was exported from {args.svn_url}, the export produced an empty "
+                    "directory. Check the URL is correct and that it actually has content at "
+                    "its current revision."
+                )
+
+            author_name, _, author_email = args.commit_author.partition("<")
+            author_name = author_name.strip()
+            author_email = author_email.rstrip(">").strip()
+
+            safe_git(["init", "-q", workdir])
+            safe_git(["add", "-A"], cwd=workdir)
+            safe_git(
+                [
+                    "-c", f"user.name={author_name}",
+                    "-c", f"user.email={author_email}",
+                    "commit", "-q", "-m",
+                    f"Snapshot of SVN revision {rev} from {args.svn_url}, no history preserved",
+                ],
+                cwd=workdir,
+            )
+        else:
+            print(f"Cloning full SVN history to {workdir}")
+            clone_cmd = [
+                "svn",
+                "clone",
+                "-s",
+                args.svn_url,
+                workdir,
+                "--authors-file",
+                args.authors_file,
+            ]
+            if svn_username:
+                clone_cmd += ["--username", svn_username]
+            safe_git(clone_cmd, env=svn_env)
 
         head_check = subprocess.run(
             ["git", *safe_git_args, "rev-parse", "HEAD"], cwd=workdir, capture_output=True
         )
         if head_check.returncode != 0:
+            if args.snapshot_only:
+                sys.exit(f"No commit was created for {args.svn_url}.")
             sys.exit(
                 f"No history was imported from {args.svn_url}. This usually means the "
                 "repository doesn't use the standard trunk/branches/tags layout that "

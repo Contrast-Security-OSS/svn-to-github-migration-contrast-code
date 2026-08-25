@@ -4,6 +4,7 @@ set -eu
 usage() {
   cat <<EOF
 Usage: $0 --svn-url <url> --github-org <org> --github-repo <repo> --authors-file <path> [--workdir <path>] [--github-host <host>] [--allowed-admins <login1,login2>]
+       $0 --svn-url <url> --github-org <org> --github-repo <repo> --snapshot-only [--commit-author <name-and-email>] [--workdir <path>] [--github-host <host>] [--allowed-admins <login1,login2>]
 
 Required environment variable:
   GITHUB_TOKEN    GitHub token with permission to create and push to repos in --github-org
@@ -19,6 +20,19 @@ it never reuses a pre-existing directory, see REQUIREMENTS.md for why.
 direct collaborators on a pre-existing destination repo under an
 organization. Defaults to none, meaning any direct collaborator on an
 existing org repo causes the run to refuse rather than push into it.
+
+--snapshot-only skips SVN history entirely and imports just the current
+revision as a single commit with no history. Use this when the full SVN
+history is too large for a single GitHub push, GitHub enforces a hard limit
+around 2GB per push, and a full-history git-svn clone of a large, old SVN
+repository routinely exceeds that even when the current code is small. Not
+required or used in this mode: --authors-file, and the standard
+trunk/branches/tags layout, --svn-url can point at any URL within the
+repository, a specific branch included.
+
+--commit-author sets the Git author and committer for the single snapshot
+commit, in "Name <email>" form, only used with --snapshot-only. Defaults to
+"SVN Snapshot Import <svn-snapshot-import@localhost>".
 EOF
   exit 1
 }
@@ -30,6 +44,8 @@ AUTHORS_FILE=""
 WORKDIR=""
 GITHUB_HOST="github.com"
 ALLOWED_ADMINS=""
+SNAPSHOT_ONLY=0
+COMMIT_AUTHOR="SVN Snapshot Import <svn-snapshot-import@localhost>"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +56,8 @@ while [ $# -gt 0 ]; do
     --workdir) WORKDIR="$2"; shift 2 ;;
     --github-host) GITHUB_HOST="$2"; shift 2 ;;
     --allowed-admins) ALLOWED_ADMINS="$2"; shift 2 ;;
+    --snapshot-only) SNAPSHOT_ONLY=1; shift ;;
+    --commit-author) COMMIT_AUTHOR="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "Unknown argument: $1" >&2; usage ;;
   esac
@@ -48,7 +66,9 @@ done
 [ -n "$SVN_URL" ] || { echo "Missing --svn-url" >&2; usage; }
 [ -n "$GITHUB_ORG" ] || { echo "Missing --github-org" >&2; usage; }
 [ -n "$GITHUB_REPO" ] || { echo "Missing --github-repo" >&2; usage; }
-[ -n "$AUTHORS_FILE" ] || { echo "Missing --authors-file" >&2; usage; }
+if [ "$SNAPSHOT_ONLY" != "1" ]; then
+  [ -n "$AUTHORS_FILE" ] || { echo "Missing --authors-file" >&2; usage; }
+fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN environment variable is required}"
 
 WORKDIR="${WORKDIR:-./svn-import/$GITHUB_REPO}"
@@ -62,7 +82,9 @@ fi
 for tool in git svn curl base64; do
   command -v "$tool" >/dev/null 2>&1 || { echo "Required tool not found: $tool" >&2; exit 1; }
 done
-git svn --version >/dev/null 2>&1 || { echo "git-svn is not installed" >&2; exit 1; }
+if [ "$SNAPSHOT_ONLY" != "1" ]; then
+  git svn --version >/dev/null 2>&1 || { echo "git-svn is not installed" >&2; exit 1; }
+fi
 
 # core.hooksPath is redirected to this empty directory, and core.fsmonitor is
 # cleared, on every git invocation this script makes, including the initial
@@ -100,7 +122,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
+if [ "$SNAPSHOT_ONLY" != "1" ] && [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
   echo "Seeding SVN credential cache"
   # --password-from-stdin keeps the password out of argv, where it would
   # otherwise be readable by any local user via /proc/<pid>/cmdline or ps for
@@ -108,6 +130,10 @@ if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
   # svn to actually cache it, the stock 'ask' default silently declines to
   # persist the password under --non-interactive, which would otherwise make
   # the later git-svn calls fail to authenticate with no cached credential.
+  # --snapshot-only doesn't need any of this, 'svn export' takes credentials
+  # directly on every call, unlike git-svn it has no need to read them back
+  # out of a cache, so there's no plaintext password to cache or clean up in
+  # that mode at all.
   printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn info --non-interactive \
     --config-option servers:global:store-plaintext-passwords=yes \
     --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL" >/dev/null
@@ -241,19 +267,52 @@ if [ -e "$WORKDIR" ]; then
   exit 1
 fi
 
-echo "Cloning full SVN history to $WORKDIR"
 mkdir -p "$(dirname "$WORKDIR")"
-if [ -n "${SVN_USERNAME:-}" ]; then
-  HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE" --username "$SVN_USERNAME"
+
+if [ "$SNAPSHOT_ONLY" = "1" ]; then
+  echo "Exporting current revision (no history) from $SVN_URL to $WORKDIR"
+  if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
+    SVN_REV=$(HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision \
+      --username "$SVN_USERNAME" --password "$SVN_PASSWORD" "$SVN_URL")
+    printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn export --force --non-interactive \
+      --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL" "$WORKDIR" >/dev/null
+  else
+    SVN_REV=$(HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision "$SVN_URL")
+    HOME="$SVN_CONFIG_DIR" svn export --force --non-interactive "$SVN_URL" "$WORKDIR" >/dev/null
+  fi
+
+  if [ -z "$(find "$WORKDIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "Nothing was exported from $SVN_URL, the export produced an empty directory." >&2
+    echo "Check the URL is correct and that it actually has content at its current revision." >&2
+    exit 1
+  fi
+
+  COMMIT_AUTHOR_NAME="${COMMIT_AUTHOR%% <*}"
+  COMMIT_AUTHOR_EMAIL="${COMMIT_AUTHOR#*<}"
+  COMMIT_AUTHOR_EMAIL="${COMMIT_AUTHOR_EMAIL%>}"
+
+  safe_git init -q "$WORKDIR"
+  cd "$WORKDIR"
+  safe_git add -A
+  safe_git -c "user.name=$COMMIT_AUTHOR_NAME" -c "user.email=$COMMIT_AUTHOR_EMAIL" \
+    commit -q -m "Snapshot of SVN revision $SVN_REV from $SVN_URL, no history preserved"
 else
-  HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE"
+  echo "Cloning full SVN history to $WORKDIR"
+  if [ -n "${SVN_USERNAME:-}" ]; then
+    HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE" --username "$SVN_USERNAME"
+  else
+    HOME="$SVN_CONFIG_DIR" safe_git svn clone -s "$SVN_URL" "$WORKDIR" --authors-file "$AUTHORS_FILE"
+  fi
+  cd "$WORKDIR"
 fi
 
-cd "$WORKDIR"
-
 if ! safe_git rev-parse HEAD >/dev/null 2>&1; then
-  echo "No history was imported from $SVN_URL." >&2
-  echo "This usually means the repository doesn't use the standard trunk/branches/tags layout that 'git svn clone -s' expects, check the SVN URL and layout before retrying." >&2
+  if [ "$SNAPSHOT_ONLY" = "1" ]; then
+    echo "No commit was created for $SVN_URL." >&2
+  else
+    echo "No history was imported from $SVN_URL." >&2
+    echo "This usually means the repository doesn't use the standard trunk/branches/tags layout that 'git svn clone -s' expects, check the SVN URL and layout before retrying." >&2
+  fi
   exit 1
 fi
 
