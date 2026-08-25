@@ -10,18 +10,32 @@ param(
     [Parameter(Mandatory = $true)][string]$SvnUrl,
     [Parameter(Mandatory = $true)][string]$GitHubOrg,
     [Parameter(Mandatory = $true)][string]$GitHubRepo,
-    [Parameter(Mandatory = $true)][string]$AuthorsFile,
+    [string]$AuthorsFile,
     [string]$WorkDir,
     [string]$GitHubHost = "github.com",
     # Comma-separated GitHub logins permitted to be direct collaborators on a
     # pre-existing destination repo under an organization. Defaults to none,
     # meaning any direct collaborator on an existing org repo causes the run
     # to refuse rather than push into it.
-    [string]$AllowedAdmins = ""
+    [string]$AllowedAdmins = "",
+    # Skips SVN history entirely and imports just the current revision as a
+    # single commit with no history. Use this when the full SVN history is
+    # too large for a single GitHub push, GitHub enforces a hard limit around
+    # 2GB per push. -AuthorsFile is not required or used in this mode, and
+    # -SvnUrl doesn't need to point at a trunk/branches/tags layout, any URL
+    # within the repository works.
+    [switch]$SnapshotOnly,
+    # Git author and committer, "Name <email>", for the single snapshot
+    # commit. Only used with -SnapshotOnly.
+    [string]$CommitAuthor = "SVN Snapshot Import <svn-snapshot-import@localhost>"
 )
 
 $ErrorActionPreference = "Stop"
 $AllowedAdminsSet = @($AllowedAdmins -split "," | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim().ToLower() })
+
+if (-not $SnapshotOnly -and -not $AuthorsFile) {
+    throw "-AuthorsFile is required unless -SnapshotOnly is set"
+}
 
 if (-not $env:GITHUB_TOKEN) {
     throw "GITHUB_TOKEN environment variable is required"
@@ -41,9 +55,11 @@ foreach ($tool in @("git", "svn")) {
         throw "Required tool not found: $tool"
     }
 }
-git svn --version | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "git-svn is not installed"
+if (-not $SnapshotOnly) {
+    git svn --version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "git-svn is not installed"
+    }
 }
 
 # This script always clones fresh, it never reuses a pre-existing directory.
@@ -121,7 +137,7 @@ New-Item -ItemType Directory -Path $SvnHomeDir | Out-Null
 $SvnIsolationEnv = @{ HOME = $SvnHomeDir; APPDATA = $SvnHomeDir }
 
 try {
-    if ($SvnUsername -and $SvnPassword) {
+    if (-not $SnapshotOnly -and $SvnUsername -and $SvnPassword) {
         Write-Host "Seeding SVN credential cache"
         # --password-from-stdin keeps the password out of argv, where it
         # would otherwise be readable by any local user via /proc/<pid>/cmdline
@@ -129,7 +145,11 @@ try {
         # is required for svn to actually cache it, the stock 'ask' default
         # silently declines to persist the password under --non-interactive,
         # which would otherwise make the later git-svn calls fail to
-        # authenticate with no cached credential.
+        # authenticate with no cached credential. -SnapshotOnly doesn't need
+        # any of this, 'svn export' takes credentials directly on every
+        # call, unlike git-svn it has no need to read them back out of a
+        # cache, so there's no plaintext password to cache or clean up in
+        # that mode at all.
         foreach ($key in $SvnIsolationEnv.Keys) { Set-Item "Env:$key" $SvnIsolationEnv[$key] }
         try {
             $SvnPassword | svn info --non-interactive `
@@ -232,16 +252,57 @@ try {
         }
     }
 
-    Write-Host "Cloning full SVN history to $WorkDir"
     New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
-    if ($SvnUsername) {
-        Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile", "--username", "$SvnUsername") -ExtraEnv $SvnIsolationEnv
+
+    if ($SnapshotOnly) {
+        Write-Host "Exporting current revision (no history) from $SvnUrl to $WorkDir"
+        foreach ($key in $SvnIsolationEnv.Keys) { Set-Item "Env:$key" $SvnIsolationEnv[$key] }
+        try {
+            if ($SvnUsername -and $SvnPassword) {
+                $Rev = ($SvnPassword | svn info --non-interactive --show-item revision --username "$SvnUsername" --password-from-stdin "$SvnUrl").Trim()
+                if ($LASTEXITCODE -ne 0) { throw "Failed to read the current SVN revision from $SvnUrl" }
+                $SvnPassword | svn export --force --non-interactive --username "$SvnUsername" --password-from-stdin "$SvnUrl" "$WorkDir" | Out-Null
+            } else {
+                $Rev = (svn info --non-interactive --show-item revision "$SvnUrl").Trim()
+                if ($LASTEXITCODE -ne 0) { throw "Failed to read the current SVN revision from $SvnUrl" }
+                svn export --force --non-interactive "$SvnUrl" "$WorkDir" | Out-Null
+            }
+            if ($LASTEXITCODE -ne 0) {
+                throw "svn export failed with exit code $LASTEXITCODE"
+            }
+        } finally {
+            foreach ($key in $SvnIsolationEnv.Keys) { Remove-Item "Env:$key" -ErrorAction SilentlyContinue }
+        }
+
+        if (-not (Get-ChildItem -Path $WorkDir -Force | Select-Object -First 1)) {
+            throw "Nothing was exported from $SvnUrl, the export produced an empty directory. Check the URL is correct and that it actually has content at its current revision."
+        }
+
+        $CommitAuthorName, $CommitAuthorEmail = $CommitAuthor -split "<", 2
+        $CommitAuthorName = $CommitAuthorName.Trim()
+        $CommitAuthorEmail = $CommitAuthorEmail.TrimEnd(">").Trim()
+
+        Invoke-SafeGit -GitArgs @("init", "-q", "$WorkDir")
+        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @("add", "-A")
+        Invoke-SafeGit -WorkingDirectory $WorkDir -GitArgs @(
+            "-c", "user.name=$CommitAuthorName",
+            "-c", "user.email=$CommitAuthorEmail",
+            "commit", "-q", "-m", "Snapshot of SVN revision $Rev from $SvnUrl, no history preserved"
+        )
     } else {
-        Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile") -ExtraEnv $SvnIsolationEnv
+        Write-Host "Cloning full SVN history to $WorkDir"
+        if ($SvnUsername) {
+            Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile", "--username", "$SvnUsername") -ExtraEnv $SvnIsolationEnv
+        } else {
+            Invoke-SafeGit -GitArgs @("svn", "clone", "-s", "$SvnUrl", "$WorkDir", "--authors-file", "$AuthorsFile") -ExtraEnv $SvnIsolationEnv
+        }
     }
 
     git -C $WorkDir -c "core.hooksPath=$HooksNeutralizeDir" -c "core.fsmonitor=" rev-parse HEAD 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
+        if ($SnapshotOnly) {
+            throw "No commit was created for $SvnUrl."
+        }
         throw "No history was imported from $SvnUrl. This usually means the repository doesn't use the standard trunk/branches/tags layout that 'git svn clone -s' expects, check the SVN URL and layout before retrying."
     }
 
