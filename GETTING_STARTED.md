@@ -100,9 +100,45 @@ $env:SVN_PASSWORD = "YOUR_SVN_PASSWORD"
 
 All three print progress as they go, seeding credentials if needed, checking or creating the destination repo, cloning the full SVN history, then pushing. The last line on success is `Done. GitHub will trigger the Contrast Scan integration from this push.`
 
+## If your SVN repository is too large to push with full history
+
+GitHub enforces a hard limit around 2GB on a single push. A full-history clone of an old or large SVN repository can easily exceed that, even when the current code itself is small, since it converts every past revision, not just the current one. If a normal run fails on push size, or you already know your SVN repository's total history is in that range, add `--snapshot-only` (`-SnapshotOnly` in PowerShell). This imports only the current revision as a single commit, no history, which is usually all Contrast Scan needs anyway. See "Repositories too large to push with full history" in `REQUIREMENTS.md` for the full explanation.
+
+In this mode, drop `--authors-file` entirely, it's not used, and optionally set `--commit-author`/`-CommitAuthor` to something more meaningful than the default:
+
+```
+# shell
+./import_svn_to_github.sh \
+  --svn-url "YOUR_SVN_URL" \
+  --github-org "YOUR_GITHUB_ORG_OR_USERNAME" \
+  --github-repo "YOUR_DESTINATION_REPO_NAME" \
+  --snapshot-only \
+  --commit-author "Your Name <you@example.com>"
+
+# Python
+python3 import_svn_to_github.py \
+  --svn-url "YOUR_SVN_URL" \
+  --github-org "YOUR_GITHUB_ORG_OR_USERNAME" \
+  --github-repo "YOUR_DESTINATION_REPO_NAME" \
+  --snapshot-only \
+  --commit-author "Your Name <you@example.com>"
+```
+
+```powershell
+# PowerShell
+./Import-SvnToGitHub.ps1 `
+  -SvnUrl "YOUR_SVN_URL" `
+  -GitHubOrg "YOUR_GITHUB_ORG_OR_USERNAME" `
+  -GitHubRepo "YOUR_DESTINATION_REPO_NAME" `
+  -SnapshotOnly `
+  -CommitAuthor "Your Name <you@example.com>"
+```
+
+`GITHUB_TOKEN`, and `SVN_USERNAME`/`SVN_PASSWORD` if needed, are set the same way as Step 4.
+
 ## Step 5, verify the result
 
-Open the destination repository on GitHub. You should see your SVN project's files, and a commit history where every commit message matches an SVN revision, with a `git-svn-id:` trailer at the bottom naming the source revision.
+Open the destination repository on GitHub. You should see your SVN project's files. With the default full-history mode, the commit history has one commit per SVN revision, each with a `git-svn-id:` trailer naming its source revision. With `--snapshot-only`, there's exactly one commit, named after the SVN revision it was exported from, and no history before it.
 
 ## Things to know before running this for real
 
@@ -111,6 +147,7 @@ Open the destination repository on GitHub. You should see your SVN project's fil
 - **Large files.** If a push fails or warns about a file over GitHub's size limits, see "Large files" in `REQUIREMENTS.md`, this isn't handled automatically.
 - **A TLS-inspecting corporate proxy or VPN** (Netskope and similar) will break the GitHub API calls with a certificate error unless its CA certificate is trusted on the machine running the script. See "TLS-inspecting corporate proxies" in `REQUIREMENTS.md` for the exact environment variables each script needs.
 - **GitHub Enterprise Server** instead of github.com, pass `--github-host`/`-GitHubHost` with your GHES hostname.
+- **Repository too large for a single push.** See "If your SVN repository is too large to push with full history" above, `--snapshot-only` trades full history for a push that actually fits.
 
 ## If something goes wrong
 
