@@ -71,6 +71,12 @@ if [ "$SNAPSHOT_ONLY" != "1" ]; then
 fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN environment variable is required}"
 
+if { [ -n "${SVN_USERNAME:-}" ] && [ -z "${SVN_PASSWORD:-}" ]; } || \
+   { [ -z "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; }; then
+  echo "SVN_USERNAME and SVN_PASSWORD must be set together when SVN authentication is required." >&2
+  exit 1
+fi
+
 WORKDIR="${WORKDIR:-./svn-import/$GITHUB_REPO}"
 
 if [ "$GITHUB_HOST" = "github.com" ]; then
@@ -272,8 +278,8 @@ mkdir -p "$(dirname "$WORKDIR")"
 if [ "$SNAPSHOT_ONLY" = "1" ]; then
   echo "Exporting current revision (no history) from $SVN_URL to $WORKDIR"
   if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
-    SVN_REV=$(HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision \
-      --username "$SVN_USERNAME" --password "$SVN_PASSWORD" "$SVN_URL")
+    SVN_REV=$(printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision \
+      --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL")
     printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn export --force --non-interactive \
       --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL" "$WORKDIR" >/dev/null
   else
