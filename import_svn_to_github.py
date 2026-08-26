@@ -78,6 +78,10 @@ def main():
         sys.exit("GITHUB_TOKEN environment variable is required")
     svn_username = os.environ.get("SVN_USERNAME")
     svn_password = os.environ.get("SVN_PASSWORD")
+    if bool(svn_username) != bool(svn_password):
+        sys.exit(
+            "SVN_USERNAME and SVN_PASSWORD must be set together when SVN authentication is required"
+        )
 
     workdir = args.workdir or os.path.join("svn-import", args.github_repo)
     api_base = (

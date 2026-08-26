@@ -71,6 +71,12 @@ if [ "$SNAPSHOT_ONLY" != "1" ]; then
 fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN environment variable is required}"
 
+if { [ -n "${SVN_USERNAME:-}" ] && [ -z "${SVN_PASSWORD:-}" ]; } || \
+   { [ -z "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; }; then
+  echo "SVN_USERNAME and SVN_PASSWORD must be set together when SVN authentication is required." >&2
+  exit 1
+fi
+
 WORKDIR="${WORKDIR:-./svn-import/$GITHUB_REPO}"
 
 if [ "$GITHUB_HOST" = "github.com" ]; then

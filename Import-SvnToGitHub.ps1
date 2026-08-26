@@ -44,6 +44,10 @@ $Token = $env:GITHUB_TOKEN
 $SvnUsername = $env:SVN_USERNAME
 $SvnPassword = $env:SVN_PASSWORD
 
+if (($SvnUsername -and -not $SvnPassword) -or (-not $SvnUsername -and $SvnPassword)) {
+    throw "SVN_USERNAME and SVN_PASSWORD must be set together when SVN authentication is required"
+}
+
 if (-not $WorkDir) {
     $WorkDir = Join-Path "svn-import" $GitHubRepo
 }
