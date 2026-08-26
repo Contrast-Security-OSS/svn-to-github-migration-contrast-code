@@ -272,8 +272,8 @@ mkdir -p "$(dirname "$WORKDIR")"
 if [ "$SNAPSHOT_ONLY" = "1" ]; then
   echo "Exporting current revision (no history) from $SVN_URL to $WORKDIR"
   if [ -n "${SVN_USERNAME:-}" ] && [ -n "${SVN_PASSWORD:-}" ]; then
-    SVN_REV=$(HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision \
-      --username "$SVN_USERNAME" --password "$SVN_PASSWORD" "$SVN_URL")
+    SVN_REV=$(printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn info --non-interactive --show-item revision \
+      --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL")
     printf '%s' "$SVN_PASSWORD" | HOME="$SVN_CONFIG_DIR" svn export --force --non-interactive \
       --username "$SVN_USERNAME" --password-from-stdin "$SVN_URL" "$WORKDIR" >/dev/null
   else
